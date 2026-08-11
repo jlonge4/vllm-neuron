@@ -960,17 +960,28 @@ class Qwen3MoeExperts(nn.Module):
                 [[self.ep_rank]], dtype=torch.int32, device=hidden_states.device
             )
 
-        return NF.moe_block_tkg(
-            inp=hidden_states.unsqueeze(0),
-            gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
-            router_weights=self.router_weight.T,
-            expert_gate_up_weights=self.gate_up_proj_weight.reshape(
+        # FP8 mode: weights are uint32 packed, pass scales
+        is_fp8 = self.gate_up_proj_weight.dtype == torch.uint32
+        if is_fp8:
+            gate_up_w = self.gate_up_proj_weight
+            down_w = self.down_proj_weight
+        else:
+            gate_up_w = self.gate_up_proj_weight.reshape(
                 self.num_local_experts,
                 self.hidden_size,
                 2,
                 self.intermediate_size_per_rank,
-            ),
-            expert_down_weights=self.down_proj_weight,
+            )
+            down_w = self.down_proj_weight
+
+        return NF.moe_block_tkg(
+            inp=hidden_states.unsqueeze(0),
+            gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
+            router_weights=self.router_weight.T,
+            expert_gate_up_weights=gate_up_w,
+            expert_down_weights=down_w,
+            expert_gate_up_weights_scale=self.gate_up_proj_scale if is_fp8 else None,
+            expert_down_weights_scale=self.down_proj_scale if is_fp8 else None,
             rank_id=rank_id,
             top_k=self.num_experts_per_token,
             eps=self.rms_norm_eps,
@@ -1930,7 +1941,107 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsEagle3):
 
         self._load_kv_cache_scales(checkpoint, device)
 
+        # FP8 quantization: convert expert weights before loading to device
+        if getattr(self.config.neuron_config, "quantization", None) == "fp8":
+            self._quantize_expert_state_dict_fp8(rank_sharded_checkpoint)
+
         self.load_state_dict(rank_sharded_checkpoint, strict=False, assign=True)
+
+    def _quantize_expert_state_dict_fp8(self, state_dict: dict):
+        """Quantize expert weights in the state dict (CPU) to x4-packed FP8."""
+        import math
+        _PMAX, _Q_WIDTH, FP8_MAX = 128, 4, 240.0
+
+        first_layer = self.model.layers[0].mlp.experts
+        H = first_layer.hidden_size
+        I = first_layer.intermediate_size_per_rank
+        E_L = first_layer.num_local_experts
+        n_H512 = H // (_PMAX * _Q_WIDTH)
+        n_I512 = math.ceil(I / (_PMAX * _Q_WIDTH))
+        n_I_chunks = n_I512 * _Q_WIDTH
+
+        def _pack_proj(proj_bf16):
+            """Pack [H, I] bf16 → [128, n_H512, I] uint32 + [n_I_chunks] scale."""
+            w_f32 = proj_bf16.float()
+            total_I = n_I_chunks * _PMAX
+            w_padded = torch.nn.functional.pad(w_f32, (0, total_I - I)) if total_I > I else w_f32[:, :total_I]
+            w_chunks = w_padded.reshape(H, n_I_chunks, _PMAX)
+            chunk_absmax = w_chunks.abs().amax(dim=(0, 2)).clamp(min=1e-12)
+            chunk_sc = chunk_absmax / FP8_MAX
+            w_scaled = w_chunks / chunk_sc.unsqueeze(0).unsqueeze(-1)
+            w_fp8 = w_scaled.reshape(H, total_I)[:, :I].clamp(-FP8_MAX, FP8_MAX).contiguous().to(torch.float8_e4m3fn)
+            w_r = w_fp8.reshape(_PMAX, _Q_WIDTH, n_H512, I).permute(0, 2, 3, 1).contiguous()
+            bv = w_r.view(torch.uint8)
+            packed = (bv[..., 0].long() | (bv[..., 1].long() << 8) |
+                      (bv[..., 2].long() << 16) | (bv[..., 3].long() << 24)).to(torch.uint32)
+            return packed, chunk_sc
+
+        for layer_id in range(len(self.model.layers)):
+            prefix = f"model.layers.{layer_id}.mlp.experts"
+            gu_key = f"{prefix}.gate_up_proj_weight"
+            down_key = f"{prefix}.down_proj_weight"
+
+            if gu_key not in state_dict:
+                continue
+
+            gate_up_bf16 = state_dict[gu_key].contiguous().cpu()  # [E_L, H, 2*I]
+            gate_bf16 = gate_up_bf16[:, :, :I].contiguous()
+            up_bf16 = gate_up_bf16[:, :, I:].contiguous()
+
+            gate_packed_list, up_packed_list = [], []
+            gate_sc_list, up_sc_list = [], []
+            for e in range(E_L):
+                gp, gs = _pack_proj(gate_bf16[e])
+                up, us = _pack_proj(up_bf16[e])
+                gate_packed_list.append(gp)
+                up_packed_list.append(up)
+                gate_sc_list.append(gs)
+                up_sc_list.append(us)
+
+            state_dict[gu_key] = torch.stack(
+                [torch.stack(gate_packed_list), torch.stack(up_packed_list)], dim=2
+            ).contiguous()
+            state_dict[f"{prefix}.gate_up_proj_scale"] = torch.stack(
+                [torch.stack(gate_sc_list), torch.stack(up_sc_list)], dim=1
+            ).contiguous()
+
+            # Down: [E_L, I, H]
+            down_bf16 = state_dict[down_key].contiguous().cpu()
+            down_packed_list, down_sc_list = [], []
+            n_H_chunks = H // _PMAX
+            for e in range(E_L):
+                w_f32 = down_bf16[e].float()
+                w_chunked = w_f32.reshape(I, n_H_chunks, _PMAX)
+                chunk_absmax = w_chunked.abs().amax(dim=(0, 2)).clamp(min=1e-12)
+                chunk_sc = chunk_absmax / FP8_MAX
+                w_scaled = w_chunked / chunk_sc.unsqueeze(0).unsqueeze(-1)
+                w_fp8 = w_scaled.reshape(I, H).clamp(-FP8_MAX, FP8_MAX).contiguous().to(torch.float8_e4m3fn)
+                I_pad = n_I512 * _PMAX * _Q_WIDTH
+                w_fp8_p = torch.nn.functional.pad(w_fp8, (0, 0, 0, I_pad - I)) if I_pad > I else w_fp8
+                w_r = w_fp8_p.reshape(_PMAX, _Q_WIDTH, n_I512, H).permute(0, 2, 3, 1).contiguous()
+                bv = w_r.view(torch.uint8)
+                packed = (bv[..., 0].long() | (bv[..., 1].long() << 8) |
+                          (bv[..., 2].long() << 16) | (bv[..., 3].long() << 24)).to(torch.uint32)
+                down_packed_list.append(packed)
+                down_sc_list.append(chunk_sc)
+
+            state_dict[down_key] = torch.stack(down_packed_list)
+            state_dict[f"{prefix}.down_proj_scale"] = torch.stack(down_sc_list)
+
+        # Register scale buffers so load_state_dict can assign them
+        for layer_id in range(len(self.model.layers)):
+            experts = self.model.layers[layer_id].mlp.experts
+            experts.register_buffer("gate_up_proj_scale", torch.empty(E_L, 2, n_I_chunks, dtype=torch.float32))
+            experts.register_buffer("down_proj_scale", torch.empty(E_L, H // _PMAX, dtype=torch.float32))
+            # Re-register weight params with correct dtype/shape for FP8
+            experts.gate_up_proj_weight = nn.Parameter(
+                torch.empty(E_L, _PMAX, 2, n_H512, I, dtype=torch.uint32), requires_grad=False
+            )
+            experts.down_proj_weight = nn.Parameter(
+                torch.empty(E_L, _PMAX, n_I512, H, dtype=torch.uint32), requires_grad=False
+            )
+
+        logger.info("FP8 expert weight quantization complete")
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None

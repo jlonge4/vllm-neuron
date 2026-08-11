@@ -40,7 +40,13 @@ class Qwen3MoeForCausalLM(nn.Module):
 
             return Model.from_configs(hf_config, neuron_config)
 
-        # Default to bf16 for now
+        if quantization == "fp8":
+            # FP8 uses the same model but quantizes expert weights at load time
+            from .model_bf16 import Qwen3MoeForCausalLM as Model
+
+            return Model.from_configs(hf_config, neuron_config)
+
+        # Default to bf16
         from .model_bf16 import Qwen3MoeForCausalLM as Model
 
         return Model.from_configs(hf_config, neuron_config)
