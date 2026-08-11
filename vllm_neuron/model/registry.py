@@ -22,6 +22,7 @@ def get_models() -> list[tuple[str, type]]:
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Qwen3MoeForCausalLM", Qwen3MoeForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
+        ("Eagle3LlamaForCausalLMEagle3", Eagle3LlamaForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
     ]
 
