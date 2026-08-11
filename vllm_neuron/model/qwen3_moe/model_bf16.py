@@ -555,8 +555,8 @@ class Qwen3MoeAttention(nn.Module):
                 qk_norm_pre_rope_q_norm=NormType.RMS_NORM,
                 qk_norm_pre_rope_k_norm=NormType.RMS_NORM,
                 qk_norm_pre_rope_eps=self.rms_norm_eps,
-                qk_norm_pre_rope_q_gamma=self.q_norm_weight,
-                qk_norm_pre_rope_k_gamma=self.k_norm_weight,
+                qk_norm_pre_rope_q_gamma=self.q_norm_weight.unsqueeze(0),
+                qk_norm_pre_rope_k_gamma=self.k_norm_weight.unsqueeze(0),
             ).squeeze(0)
 
             q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
@@ -900,16 +900,14 @@ class Qwen3MoeExperts(nn.Module):
             )
         )
 
-        def _maybe_ep_wrap(loader):
-            if self.ep_degree > 1:
-                loader = expert_parallel_tensor_dim_loader(local_expert_indices, loader)
+        def _maybe_rank_override(loader):
             if self.mlp_dp_size > 1:
                 loader = with_rank_override(loader, rank=self.mlp_tp_rank)
             return loader
 
         set_weight_loader(
             self.gate_up_proj_weight,
-            _maybe_ep_wrap(
+            _maybe_rank_override(
                 expert_gate_up_weight_sharding_loader(
                     shard_size=self.intermediate_size_per_rank * 2,
                     num_shards=self.tp_degree,
@@ -920,7 +918,7 @@ class Qwen3MoeExperts(nn.Module):
         )
         set_weight_loader(
             self.down_proj_weight,
-            _maybe_ep_wrap(
+            _maybe_rank_override(
                 expert_down_weight_sharding_loader(
                     shard_size=self.intermediate_size_per_rank,
                     num_shards=self.tp_degree,
@@ -1904,17 +1902,25 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsEagle3):
                 f"{layer_prefix}.mlp.gate.weight"
             )
             # Expert weights: provide per-expert keys as list for the weight loader
-            num_experts = self.config.num_experts
+            # With EP, only load the local expert subset for this rank
+            moe_layer = self.model.layers[layer_id].mlp.experts
+            if moe_layer.ep_degree > 1:
+                expert_indices = list(range(
+                    moe_layer.ep_rank * moe_layer.num_local_experts,
+                    (moe_layer.ep_rank + 1) * moe_layer.num_local_experts,
+                ))
+            else:
+                expert_indices = list(range(self.config.num_experts))
             mappings[f"{layer_prefix}.mlp.experts.gate_up_proj_weight"] = [
                 f"{layer_prefix}.mlp.experts.{e}.gate_proj.weight"
-                for e in range(num_experts)
+                for e in expert_indices
             ] + [
                 f"{layer_prefix}.mlp.experts.{e}.up_proj.weight"
-                for e in range(num_experts)
+                for e in expert_indices
             ]
             mappings[f"{layer_prefix}.mlp.experts.down_proj_weight"] = [
                 f"{layer_prefix}.mlp.experts.{e}.down_proj.weight"
-                for e in range(num_experts)
+                for e in expert_indices
             ]
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
